@@ -1,0 +1,9 @@
+[package]
+name = "async-targets"
+version = "0.1.0"
+authors = ["Bobby Reynolds <bobby@reynoldsbd.net>"]
+edition = "2018"
+
+[dependencies]
+async-std = { version = "1.6", features = ["attributes"] }
+async-trait = "0.1"
