@@ -1,76 +1,62 @@
+//! The `async-jobs` crate provides a framework for describing and executing a collection
+//! of interdependent and asynchronous jobs. It is intended to be used as the scheduling
+//! backbone for programs such as build systems which need to orchestrate arbitrary
+//! collections of tasks with complex dependency graphs.
+//!
+//! The main way to use this crate is by providing an implementation of the `Job`
+//! trait to describe the tasks in your program and how they depend on one another.
+//! To run your tasks, pass an instance of your `Job` to the `Scheduler::run` method.
+
 use async_trait::async_trait;
 
+// todo: docs
 #[async_trait]
-pub trait Target: Sized + PartialEq {
+pub trait Job: Sized + PartialEq {
 
+    /// Error type returned by the implementation
     type Error;
 
+    /// Returns the list of jobs that this job depends on
     fn dependencies(&self) -> Vec<Self>;
 
-    async fn update(&self) -> Result<(), Self::Error>;
+    /// Performs the work associated with this job
+    async fn run(&self) -> Result<(), Self::Error>;
 }
 
-/// Unit of work needed to update a single target
-///
-/// The scheduler represents each target in the dependency graph using a separate
-/// instance of `Job`. In addition to providing storage for the target itself, this
-/// structure holds bookkeeping information such as dependency relationships.
-struct Job<T>
-where
-    T: Target
-{
-    /// Target associated with this job
-    target: T,
-}
+/// Data structure used to schedule execution of dependent jobs
+struct Schedule<J> {
 
-impl<T> From<T> for Job<T>
-where
-    T: Target
-{
-    fn from(target: T) -> Self {
-        Job { target }
-    }
-}
-
-/// A sequence of jobs needed to update a specific target
-struct Schedule<T>
-where
-    T: Target
-{
     /// List of jobs which comprise this schedule
-    jobs: Vec<Job<T>>,
+    jobs: Vec<J>,
 
     /// List of indices (into `self.jobs`) in order of execution
     queue: Vec<usize>,
 }
 
-impl<T> Schedule<T>
-where
-    T: Target
-{
-    /// Creates a new job schedule which will update `target`
-    fn new(target: T) -> Self {
+impl<J: Job> Schedule<J> {
+
+    /// Creates a new schedule for executing `job` and its dependencies
+    fn new(job: J) -> Self {
 
         let mut sched = Self {
             jobs: Default::default(),
             queue: Default::default(),
         };
 
-        sched.add_job(target.into());
+        sched.add_job(job);
 
         sched
     }
 
-    /// Adds a job to this schedule
-    fn add_job(&mut self, job: Job<T>) -> usize {
+    /// Adds `job` and its dependencies to this schedule
+    fn add_job(&mut self, job: J) -> usize {
 
         let job_idx = self.jobs.len();
         self.jobs.push(job);
 
-        for dep in self.jobs[job_idx].target.dependencies() {
-
-            if !self.jobs.iter().any(|j| j.target == dep) {
-                self.add_job(dep.into());
+        for dep in self.jobs[job_idx].dependencies() {
+            if !self.jobs.iter().any(|j| *j == dep) {
+                self.add_job(dep);
             }
         }
 
@@ -79,22 +65,25 @@ where
     }
 }
 
+/// Schedules execution of jobs and dependencies
+///
+/// Uses the builder pattern to configure various aspects of job execution.
 pub struct Scheduler(());
 
 impl Scheduler {
 
+    /// Creates a new scheduler with default settings
     pub fn new() -> Self {
         Scheduler(())
     }
 
-    pub async fn update_target<T>(&self, target: T) -> Result<(), T::Error>
-    where
-        T: Target
-    {
-        let sched = Schedule::new(target);
+    /// Executes `job` and its dependencies on this scheduler
+    pub async fn run<J: Job>(&self, job: J) -> Result<(), J::Error> {
+
+        let sched = Schedule::new(job);
 
         for i in sched.queue {
-            sched.jobs[i].target.update().await?;
+            sched.jobs[i].run().await?;
         }
 
         Ok(())
@@ -110,7 +99,7 @@ mod tests {
 
     type TestGraph = Vec<(bool, Vec<usize>)>;
 
-    struct TestTarget<'a> {
+    struct TestJob<'a> {
         index: usize,
         graph: &'a TestGraph,
         trace: &'a Mutex<Vec<usize>>,
@@ -118,7 +107,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl<'a> Target for TestTarget<'a> {
+    impl<'a> Job for TestJob<'a> {
 
         type Error = usize;
 
@@ -127,7 +116,7 @@ mod tests {
             let mut deps = vec![];
 
             for index in &self.graph[self.index].1 {
-                deps.push(TestTarget {
+                deps.push(TestJob {
                     index: *index,
                     graph: self.graph,
                     trace: self.trace,
@@ -138,7 +127,8 @@ mod tests {
             deps
         }
 
-        async fn update(&self) -> Result<(), Self::Error> {
+        async fn run(&self) -> Result<(), Self::Error> {
+
             self.trace.lock().await
                 .push(self.index);
 
@@ -150,7 +140,7 @@ mod tests {
         }
     }
 
-    impl<'a> PartialEq for TestTarget<'a> {
+    impl<'a> PartialEq for TestJob<'a> {
         fn eq(&self, other: &Self) -> bool {
             self.index == other.index
         }
@@ -159,7 +149,7 @@ mod tests {
     async fn trace(graph: TestGraph) -> (Vec<Option<usize>>, Option<usize>) {
 
         let trace = Mutex::new(vec![]);
-        let target = TestTarget {
+        let job = TestJob {
             index: 0,
             graph: &graph,
             trace: &trace,
@@ -167,25 +157,25 @@ mod tests {
         };
 
         let sched = Scheduler::new();
-        let failed_idx = sched.update_target(target)
+        let failed_idx = sched.run(job)
             .await
             .err();
 
         let mut results = vec![None; graph.len()];
 
-        for (finished_idx, target_idx) in trace.into_inner().iter().enumerate() {
+        for (finished_idx, job_idx) in trace.into_inner().iter().enumerate() {
 
-            // Ensure no target has had its update method called more than once
-            assert!(results[*target_idx].is_none());
+            // Ensure no job has had its update method called more than once
+            assert!(results[*job_idx].is_none());
 
-            results[*target_idx] = Some(finished_idx);
+            results[*job_idx] = Some(finished_idx);
         }
 
         (results, failed_idx)
     }
 
     #[async_std::test]
-    async fn single_target() {
+    async fn single_job() {
 
         let (trace, failed) = trace(vec![
             (true, vec![]),
@@ -196,7 +186,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn single_target_fails() {
+    async fn single_job_fails() {
 
         let (trace, failed) = trace(vec![
             (false, vec![]),
@@ -271,7 +261,7 @@ mod tests {
 
         assert_eq!(failed, Some(2));
         assert_eq!(trace[0], None);
-        // target 1 may or may not be updated
+        // job 1 may or may not be updated
         assert!(trace[2].is_some());
     }
 
