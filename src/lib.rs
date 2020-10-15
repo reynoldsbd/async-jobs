@@ -7,9 +7,11 @@
 //! trait to describe the tasks in your program and how they depend on one another.
 //! To run your tasks, pass an instance of your `Job` to the `Scheduler::run` method.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 
-// todo: docs
+/// A unit of work, perhaps with dependencies
 #[async_trait]
 pub trait Job: Sized + PartialEq {
 
@@ -21,6 +23,17 @@ pub trait Job: Sized + PartialEq {
 
     /// Performs the work associated with this job
     async fn run(&self) -> Result<(), Self::Error>;
+}
+
+/// Errors returned by job scheduler
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error<E> {
+
+    /// Dependency cycle
+    Cycle,
+
+    /// One or more jobs failed
+    Fail(E),
 }
 
 /// Data structure used to schedule execution of dependent jobs
@@ -36,32 +49,44 @@ struct Schedule<J> {
 impl<J: Job> Schedule<J> {
 
     /// Creates a new schedule for executing `job` and its dependencies
-    fn new(job: J) -> Self {
+    fn new(job: J) -> Result<Self, Error<J::Error>> {
 
         let mut sched = Self {
             jobs: Default::default(),
             queue: Default::default(),
         };
 
-        sched.add_job(job);
+        let mut ancestors = Default::default();
 
-        sched
+        sched.add_job(job, &mut ancestors)?;
+
+        Ok(sched)
     }
 
     /// Adds `job` and its dependencies to this schedule
-    fn add_job(&mut self, job: J) -> usize {
+    ///
+    /// `ancestors` is used to detect and reject dependency cycles.
+    fn add_job(&mut self, job: J, ancestors: &mut HashSet<usize>) -> Result<usize, Error<J::Error>> {
 
         let job_idx = self.jobs.len();
         self.jobs.push(job);
 
+        debug_assert!(ancestors.insert(job_idx));
+
         for dep in self.jobs[job_idx].dependencies() {
-            if !self.jobs.iter().any(|j| *j == dep) {
-                self.add_job(dep);
+            if let Some(dep_idx) = self.jobs.iter().position(|j| *j == dep) {
+                if ancestors.contains(&dep_idx) {
+                    return Err(Error::Cycle)
+                }
+            } else {
+                self.add_job(dep, ancestors)?;
             }
         }
 
+        debug_assert!(ancestors.remove(&job_idx));
+
         self.queue.push(job_idx);
-        job_idx
+        Ok(job_idx)
     }
 }
 
@@ -78,12 +103,13 @@ impl Scheduler {
     }
 
     /// Executes `job` and its dependencies on this scheduler
-    pub async fn run<J: Job>(&self, job: J) -> Result<(), J::Error> {
+    pub async fn run<J: Job>(&self, job: J) -> Result<(), Error<J::Error>> {
 
-        let sched = Schedule::new(job);
+        let sched = Schedule::new(job)?;
 
         for i in sched.queue {
-            sched.jobs[i].run().await?;
+            sched.jobs[i].run().await
+                .map_err(|e| Error::Fail(e))?;
         }
 
         Ok(())
@@ -146,7 +172,7 @@ mod tests {
         }
     }
 
-    async fn trace(graph: TestGraph) -> (Vec<Option<usize>>, Option<usize>) {
+    async fn trace(graph: TestGraph) -> (Vec<Option<usize>>, Option<Error<usize>>) {
 
         let trace = Mutex::new(vec![]);
         let job = TestJob {
@@ -157,7 +183,7 @@ mod tests {
         };
 
         let sched = Scheduler::new();
-        let failed_idx = sched.run(job)
+        let err = sched.run(job)
             .await
             .err();
 
@@ -171,40 +197,40 @@ mod tests {
             results[*job_idx] = Some(finished_idx);
         }
 
-        (results, failed_idx)
+        (results, err)
     }
 
     #[async_std::test]
     async fn single_job() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(0));
     }
 
     #[async_std::test]
     async fn single_job_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (false, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(0));
+        assert_eq!(err, Some(Error::Fail(0)));
         assert_eq!(trace[0], Some(0));
     }
 
     #[async_std::test]
     async fn single_dep() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1]),
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(1));
         assert_eq!(trace[1], Some(0));
     }
@@ -212,12 +238,12 @@ mod tests {
     #[async_std::test]
     async fn single_dep_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1]),
             (false, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(1));
+        assert_eq!(err, Some(Error::Fail(1)));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], Some(0));
     }
@@ -225,12 +251,12 @@ mod tests {
     #[async_std::test]
     async fn single_dep_root_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (false, vec![1]),
             (true, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(0));
+        assert_eq!(err, Some(Error::Fail(0)));
         assert_eq!(trace[0], Some(1));
         assert_eq!(trace[1], Some(0));
     }
@@ -238,13 +264,13 @@ mod tests {
     #[async_std::test]
     async fn two_deps() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1, 2]),
             (true, vec![]),
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
         assert!(matches!(trace[1], Some(x) if x < 2));
         assert!(matches!(trace[2], Some(x) if x < 2));
@@ -253,13 +279,13 @@ mod tests {
     #[async_std::test]
     async fn two_deps_one_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1, 2]),
             (true, vec![]),
             (false, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(2));
+        assert_eq!(err, Some(Error::Fail(2)));
         assert_eq!(trace[0], None);
         // job 1 may or may not be updated
         assert!(trace[2].is_some());
@@ -268,13 +294,13 @@ mod tests {
     #[async_std::test]
     async fn single_trans_dep() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1]),
             (true, vec![2]),
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
         assert_eq!(trace[1], Some(1));
         assert_eq!(trace[2], Some(0));
@@ -283,13 +309,13 @@ mod tests {
     #[async_std::test]
     async fn single_trans_dep_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1]),
             (true, vec![2]),
             (false, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(2));
+        assert_eq!(err, Some(Error::Fail(2)));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], None);
         assert_eq!(trace[2], Some(0));
@@ -298,13 +324,13 @@ mod tests {
     #[async_std::test]
     async fn single_trans_dep_direct_dep_fails() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1]),
             (false, vec![2]),
             (true, vec![]),
         ]).await;
 
-        assert_eq!(failed, Some(1));
+        assert_eq!(err, Some(Error::Fail(1)));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], Some(1));
         assert_eq!(trace[2], Some(0));
@@ -313,14 +339,14 @@ mod tests {
     #[async_std::test]
     async fn two_deps_single_trans_dep() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
         assert!(matches!(trace[3], Some(x) if x < 3));
 
@@ -333,7 +359,7 @@ mod tests {
     #[async_std::test]
     async fn two_deps_each_with_trans_dep() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
@@ -341,7 +367,7 @@ mod tests {
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(4));
 
         let order_of_1 = trace[1].unwrap();
@@ -360,14 +386,14 @@ mod tests {
     #[async_std::test]
     async fn three_deps() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![1, 2, 3]),
             (true, vec![]),
             (true, vec![]),
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
         assert!(matches!(trace[1], Some(x) if x < 3));
         assert!(matches!(trace[2], Some(x) if x < 3));
@@ -377,14 +403,14 @@ mod tests {
     #[async_std::test]
     async fn diamond() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![2, 3]),
             (true, vec![]),
             (true, vec![1]),
             (true, vec![1]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
         assert_eq!(trace[1], Some(0));
 
@@ -399,7 +425,7 @@ mod tests {
     #[async_std::test]
     async fn diamond_with_extra_trans_deps() {
 
-        let (trace, failed) = trace(vec![
+        let (trace, err) = trace(vec![
             (true, vec![2, 3]),
             (true, vec![4]),
             (true, vec![1, 5]),
@@ -409,7 +435,7 @@ mod tests {
             (true, vec![]),
         ]).await;
 
-        assert!(failed.is_none());
+        assert!(err.is_none());
         assert_eq!(trace[0], Some(6));
 
         let order_of_2 = trace[2].unwrap();
@@ -430,5 +456,35 @@ mod tests {
 
         let order_of_6 = trace[6].unwrap();
         assert!(order_of_6 < order_of_3);
+    }
+
+    #[async_std::test]
+    async fn simple_cycle() {
+
+        let (trace, err) = trace(vec![
+            (true, vec![1]),
+            (true, vec![0]),
+        ]).await;
+
+        assert_eq!(err, Some(Error::Cycle));
+        for job in trace {
+            assert_eq!(job, None);
+        }
+    }
+
+    #[async_std::test]
+    async fn complex_cycle() {
+
+        let (trace, err) = trace(vec![
+            (true, vec![1, 2]),
+            (true, vec![3]),
+            (true, vec![1]),
+            (true, vec![2]),
+        ]).await;
+
+        assert_eq!(err, Some(Error::Cycle));
+        for job in trace {
+            assert_eq!(job, None);
+        }
     }
 }
