@@ -93,14 +93,10 @@ impl<J: Job> Schedule<J> {
 /// Schedules execution of jobs and dependencies
 ///
 /// Uses the builder pattern to configure various aspects of job execution.
+#[derive(Default)]
 pub struct Scheduler(());
 
 impl Scheduler {
-
-    /// Creates a new scheduler with default settings
-    pub fn new() -> Self {
-        Scheduler(())
-    }
 
     /// Executes `job` and its dependencies on this scheduler
     pub async fn run<J: Job>(&self, job: J) -> Result<(), Error<J::Error>> {
@@ -182,7 +178,7 @@ mod tests {
             success: graph[0].0,
         };
 
-        let sched = Scheduler::new();
+        let sched = Scheduler::default();
         let err = sched.run(job)
             .await
             .err();
