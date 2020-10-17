@@ -12,6 +12,11 @@ use std::mem;
 
 use async_trait::async_trait;
 
+#[non_exhaustive]
+pub enum Outcome {
+    Success,
+}
+
 /// A unit of work, perhaps with dependencies
 ///
 /// Use the `Job` trait to describe the different types of jobs in your program
@@ -26,7 +31,7 @@ use async_trait::async_trait;
 /// it useful to use an enum:
 ///
 /// ```
-/// use async_jobs::Job;
+/// use async_jobs::{Job, Outcome};
 /// use async_trait::async_trait;
 ///
 /// #[derive(PartialEq)]
@@ -40,7 +45,7 @@ use async_trait::async_trait;
 ///
 ///     type Error = ();
 ///
-///     async fn run(&self) -> Result<(), Self::Error> {
+///     async fn run(&self) -> Result<Outcome, Self::Error> {
 ///
 ///         match self {
 ///
@@ -53,7 +58,7 @@ use async_trait::async_trait;
 ///             },
 ///         }
 ///
-///         Ok(())
+///         Ok(Outcome::Success)
 ///     }
 ///
 ///     fn dependencies(&self) -> Vec<Self> {
@@ -81,7 +86,7 @@ pub trait Job: Sized + PartialEq {
     fn dependencies(&self) -> Vec<Self>;
 
     /// Performs the work associated with this job
-    async fn run(&self) -> Result<(), Self::Error>;
+    async fn run(&self) -> Result<Outcome, Self::Error>;
 }
 
 /// Errors returned by job scheduler
@@ -108,7 +113,7 @@ enum JobState<J: Job> {
     Failed(J::Error),
 
     /// Job finished execution successfully
-    Succeeded,
+    Succeeded(Outcome),
 }
 
 impl<J: Job> JobState<J> {
@@ -116,8 +121,8 @@ impl<J: Job> JobState<J> {
     /// Returns whether or not this state equals `JobState::Succeeded`
     fn succeeded(&self) -> bool {
         match self {
-            JobState::Succeeded => true,
-            _                   => false,
+            JobState::Succeeded(_) => true,
+            _                      => false,
         }
     }
 }
@@ -236,10 +241,12 @@ impl<J: Job> Schedule<J> {
 
     /// Marks a job as completed and updates the ready queue with any new jobs that
     /// are now ready to execute as a result.
-    fn mark_complete(&mut self, job_idx: usize, err: Option<J::Error>) {
+    fn mark_complete(&mut self, job_idx: usize, res: Result<Outcome, J::Error>) {
 
-        self.jobs[job_idx].state = err.map(|e| JobState::Failed(e))
-            .unwrap_or(JobState::Succeeded);
+        self.jobs[job_idx].state = match res {
+            Ok(outcome) => JobState::Succeeded(outcome),
+            Err(err)    => JobState::Failed(err),
+        };
 
         for dep_idx in &self.jobs[job_idx].dependents {
             let is_ready = self.jobs[*dep_idx].dependencies.iter()
@@ -256,7 +263,7 @@ impl<J: Job> Schedule<J> {
 /// Uses the builder pattern to configure various aspects of job execution.
 ///
 /// ```
-/// use async_jobs::{Job, Scheduler};
+/// use async_jobs::{Job, Outcome, Scheduler};
 /// use async_trait::async_trait;
 ///
 /// #[derive(PartialEq)]
@@ -267,9 +274,9 @@ impl<J: Job> Schedule<J> {
 ///
 ///     type Error = ();
 ///
-///     async fn run(&self) -> Result<(), Self::Error> {
+///     async fn run(&self) -> Result<Outcome, Self::Error> {
 ///         println!("message: {}", self.0);
-///         Ok(())
+///         Ok(Outcome::Success)
 ///     }
 ///
 ///     fn dependencies(&self) -> Vec<Self> { vec![] }
@@ -289,8 +296,7 @@ impl Scheduler {
         let mut sched = Schedule::new(job)?;
 
         while let Some((job, idx)) = sched.next_job() {
-            let res = job.run().await;
-            sched.mark_complete(idx, res.err());
+            sched.mark_complete(idx, job.run().await);
         }
 
         let mut errs = vec![];
@@ -345,13 +351,13 @@ mod tests {
             deps
         }
 
-        async fn run(&self) -> Result<(), Self::Error> {
+        async fn run(&self) -> Result<Outcome, Self::Error> {
 
             self.trace.lock().await
                 .push(self.index);
 
             if self.success {
-                Ok(())
+                Ok(Outcome::Success)
             } else {
                 Err(self.index)
             }
