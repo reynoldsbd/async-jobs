@@ -2,6 +2,9 @@
 name = "async-jobs"
 version = "0.1.0"
 authors = ["Bobby Reynolds <bobby@reynoldsbd.net>"]
+license = "MIT OR Apache-2.0"
+description = "Asynchronous job orchestration for Rust"
+repository = "https://github.com/reynoldsbd/async-jobs"
 edition = "2018"
 
 [dependencies]
