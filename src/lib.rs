@@ -201,7 +201,7 @@ impl<J: Job> Schedule<J> {
         let job_idx = self.jobs.len();
         self.jobs.push(job.into());
 
-        debug_assert!(ancestors.insert(job_idx));
+        assert!(ancestors.insert(job_idx));
 
         for dep in self.jobs[job_idx].job().dependencies() {
 
@@ -213,7 +213,7 @@ impl<J: Job> Schedule<J> {
             self.jobs[job_idx].dependencies.push(dep_idx);
         }
 
-        debug_assert!(ancestors.remove(&job_idx));
+        assert!(ancestors.remove(&job_idx));
 
         if self.jobs[job_idx].dependencies.len() == 0 {
             self.ready.push(job_idx);
