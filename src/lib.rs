@@ -13,6 +13,64 @@ use std::mem;
 use async_trait::async_trait;
 
 /// A unit of work, perhaps with dependencies
+///
+/// Use the `Job` trait to describe the different types of jobs in your program
+/// and how they depend on one another. An implementation has two responsibilities:
+///
+/// 1. Do some job-specific work when the `run` method is called
+/// 2. Provide a list of dependency jobs via `dependencies`
+///
+/// Note that the return type of `dependencies` is `Vec<Self>`. This restriction
+/// means that you cannot use different implementations of `Job` to represent different
+/// types of work in your program; you must provide exactly one type. You may find
+/// it useful to use an enum:
+///
+/// ```
+/// use async_jobs::Job;
+/// use async_trait::async_trait;
+///
+/// #[derive(PartialEq)]
+/// enum MyJob {
+///     DownloadFile(String),
+///     ConcatFiles(Vec<String>),
+/// }
+///
+/// #[async_trait]
+/// impl Job for MyJob {
+///
+///     type Error = ();
+///
+///     async fn run(&self) -> Result<(), Self::Error> {
+///
+///         match self {
+///
+///             MyJob::DownloadFile(file) => {
+///                 // download file...
+///             },
+///
+///             MyJob::ConcatFiles(files) => {
+///                 // concatenate files...
+///             },
+///         }
+///
+///         Ok(())
+///     }
+///
+///     fn dependencies(&self) -> Vec<Self> {
+///
+///         match self {
+///
+///             MyJob::DownloadFile(_) => vec![],
+///
+///             MyJob::ConcatFiles(files) => {
+///                 files.iter()
+///                     .map(|f| MyJob::DownloadFile(f.clone()))
+///                     .collect()
+///             },
+///         }
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait Job: Sized + PartialEq {
 
@@ -196,12 +254,36 @@ impl<J: Job> Schedule<J> {
 /// Schedules execution of jobs and dependencies
 ///
 /// Uses the builder pattern to configure various aspects of job execution.
+///
+/// ```
+/// use async_jobs::{Job, Scheduler};
+/// use async_trait::async_trait;
+///
+/// #[derive(PartialEq)]
+/// struct MyJob(String);
+///
+/// #[async_trait]
+/// impl Job for MyJob {
+///
+///     type Error = ();
+///
+///     async fn run(&self) -> Result<(), Self::Error> {
+///         println!("message: {}", self.0);
+///         Ok(())
+///     }
+///
+///     fn dependencies(&self) -> Vec<Self> { vec![] }
+/// }
+///
+/// Scheduler::default()
+///     .run(MyJob("hello, world".into()));
+/// ```
 #[derive(Default)]
 pub struct Scheduler(());
 
 impl Scheduler {
 
-    /// Executes `job` and its dependencies on this scheduler
+    /// Executes `job` and its dependencies
     pub async fn run<J: Job>(&self, job: J) -> Result<(), Error<J::Error>> {
 
         let mut sched = Schedule::new(job)?;
