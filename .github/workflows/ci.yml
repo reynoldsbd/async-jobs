@@ -9,9 +9,19 @@ on:
 name: Continuous Integration
 
 jobs:
+
   test:
-    name: Tests
+    name: Test ${{ matrix.profile.name }}
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        profile:
+        - name: Debug
+          arg: ""
+        - name: Release
+          arg: --release
+
     steps:
     - uses: actions/checkout@v2
     - uses: actions-rs/toolchain@v1
@@ -22,3 +32,4 @@ jobs:
     - uses: actions-rs/cargo@v1
       with:
         command: test
+        args: ${{ matrix.profile.arg }}
