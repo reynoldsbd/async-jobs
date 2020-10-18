@@ -58,7 +58,6 @@ jobs:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       with:
         command: publish
-        args: --dry-run
     - name: Read Crate Manifest
       id: read_manifest
       run: ${{ github.workspace }}/scripts/ReadCrateManifest.ps1
@@ -70,4 +69,3 @@ jobs:
       with:
         tag_name: v${{ steps.read_manifest.outputs.version }}
         release_name: v${{ steps.read_manifest.outputs.version }}
-        draft: true
