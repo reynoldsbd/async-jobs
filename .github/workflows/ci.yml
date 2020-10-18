@@ -10,7 +10,7 @@ on:
       release:
         description: Create a release and publish to crates.io
         required: true
-        default: false
+        default: "false"
 
 name: Continuous Integration
 
