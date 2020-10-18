@@ -5,6 +5,12 @@ on:
   pull_request:
     branches:
     - master
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Create a release and publish to crates.io
+        required: true
+        default: false
 
 name: Continuous Integration
 
@@ -33,3 +39,21 @@ jobs:
       with:
         command: test
         args: ${{ matrix.profile.arg }}
+
+  release:
+    name: Release
+    if: github.event.inputs.release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    - uses: actions-rs/cargo@v1
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      with:
+        command: publish
+        args: --dry-run
