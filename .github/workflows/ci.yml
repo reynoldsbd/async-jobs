@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: Create a release and publish to crates.io
+        description: Create Release
         required: true
         default: "false"
 
