@@ -1,238 +1,256 @@
-//! The `async-jobs` crate provides a framework for describing and executing a collection
-//! of interdependent and asynchronous jobs. It is intended to be used as the scheduling
-//! backbone for programs such as build systems which need to orchestrate arbitrary
-//! collections of tasks with complex dependency graphs.
+//! The `async-jobs` crate provides a framework for describing and executing a collection of
+//! interdependent and asynchronous jobs. It is intended to be used as the scheduling backbone for
+//! programs such as build systems which need to orchestrate arbitrary collections of tasks with
+//! complex dependency graphs.
 //!
-//! The main way to use this crate is by providing an implementation of the `Job`
-//! trait to describe the tasks in your program and how they depend on one another.
-//! To run your tasks, pass an instance of your `Job` to the `Scheduler::run` method.
+//! The main way to use this crate is by creating implementations of the `IntoJob` trait to describe
+//! the tasks in your program and how they depend on one another. To run your jobs, create a
+//! `Scheduler` and pass a job to its `run` method.
+//!
+//! # Example
+//!
+//! ```
+//! # use async_jobs::{Error, IntoJob, Outcome, Job, PlanBuilder, Scheduler};
+//! #[derive(PartialEq)]
+//! struct Foo(usize);
+//!
+//! impl IntoJob<()> for Foo {
+//!     fn into_job(&self) -> Job<()> {
+//!         let num = self.0;
+//!         Box::new(move || Box::pin(async move {
+//!             println!("foo: {}", num);
+//!             Ok(Outcome::Success)
+//!         }))
+//!     }
+//! }
+//!
+//! #[derive(PartialEq)]
+//! struct Bar(usize);
+//!
+//! impl IntoJob<()> for Bar {
+//!     fn plan(&self, plan: &mut PlanBuilder<()>) -> Result<(), Error<()>> {
+//!         plan.add_dependency(Foo(self.0 + 1))?;
+//!         plan.add_dependency(Foo(self.0 + 2))?;
+//!         Ok(())
+//!     }
+//!
+//!     fn into_job(&self) -> Job<()> {
+//!         let num = self.0;
+//!         Box::new(move || Box::pin(async move {
+//!             println!("bar: {}", num);
+//!             Ok(Outcome::Success)
+//!         }))
+//!     }
+//! }
+//!
+//! let sched = Scheduler::default();
+//! async_std::task::block_on(sched.run(Bar(7)));
+//! ```
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::iter::FromIterator;
 use std::mem;
+use std::pin::Pin;
+use std::rc::Rc;
 
-use async_trait::async_trait;
+use downcast_rs::{impl_downcast, Downcast};
 
+/// Possible job outcomes
 #[non_exhaustive]
 pub enum Outcome {
+    /// Job completed successfully
     Success,
-}
-
-/// A unit of work, perhaps with dependencies
-///
-/// Use the `Job` trait to describe the different types of jobs in your program
-/// and how they depend on one another. An implementation has two responsibilities:
-///
-/// 1. Do some job-specific work when the `run` method is called
-/// 2. Provide a list of dependency jobs via `dependencies`
-///
-/// Note that the return type of `dependencies` is `Vec<Self>`. This restriction
-/// means that you cannot use different implementations of `Job` to represent different
-/// types of work in your program; you must provide exactly one type. You may find
-/// it useful to use an enum:
-///
-/// ```
-/// use async_jobs::{Job, Outcome};
-/// use async_trait::async_trait;
-///
-/// #[derive(PartialEq)]
-/// enum MyJob {
-///     DownloadFile(String),
-///     ConcatFiles(Vec<String>),
-/// }
-///
-/// #[async_trait]
-/// impl Job for MyJob {
-///
-///     type Error = ();
-///
-///     async fn run(&self) -> Result<Outcome, Self::Error> {
-///
-///         match self {
-///
-///             MyJob::DownloadFile(file) => {
-///                 // download file...
-///             },
-///
-///             MyJob::ConcatFiles(files) => {
-///                 // concatenate files...
-///             },
-///         }
-///
-///         Ok(Outcome::Success)
-///     }
-///
-///     fn dependencies(&self) -> Vec<Self> {
-///
-///         match self {
-///
-///             MyJob::DownloadFile(_) => vec![],
-///
-///             MyJob::ConcatFiles(files) => {
-///                 files.iter()
-///                     .map(|f| MyJob::DownloadFile(f.clone()))
-///                     .collect()
-///             },
-///         }
-///     }
-/// }
-/// ```
-#[async_trait]
-pub trait Job: Sized + PartialEq {
-
-    /// Error type returned by the implementation
-    type Error;
-
-    /// Returns the list of jobs that this job depends on
-    fn dependencies(&self) -> Vec<Self>;
-
-    /// Performs the work associated with this job
-    async fn run(&self) -> Result<Outcome, Self::Error>;
 }
 
 /// Errors returned by job scheduler
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<E> {
-
-    /// Dependency cycle
+    /// Dependency cycle detected while generating job plan
     Cycle,
 
-    /// One or more jobs failed
-    Fail(Vec<E>),
+    /// One or more jobs failed while executing job plan
+    Failed(Vec<E>),
+
+    /// Arbitrary error returned by an implementation of `IntoJob::plan`
+    Plan(E),
 }
 
-/// Tracks the state of a scheduled job
-enum JobState<J: Job> {
+/// Unit of asynchronous work
+pub type Job<E> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Outcome, E>>>>>;
 
-    /// Job has not yet started running
-    Pending(J),
+/// Information needed to schedule and execute a job
+pub trait IntoJob<E>: Downcast {
+    /// Configures the job plan with information about this job, such as its dependencies.
+    fn plan(&self, plan: &mut PlanBuilder<E>) -> Result<(), Error<E>> {
+        // This default impl does not use the plan parameter, but we still want it to be named
+        // "plan" in documentation.
+        #![allow(unused_variables)]
 
-    /// Job is actively executing
-    Running,
-
-    /// Job failed execution
-    Failed(J::Error),
-
-    /// Job finished execution successfully
-    Succeeded(Outcome),
-}
-
-impl<J: Job> JobState<J> {
-
-    /// Returns whether or not this state equals `JobState::Succeeded`
-    fn succeeded(&self) -> bool {
-        match self {
-            JobState::Succeeded(_) => true,
-            _                      => false,
-        }
+        Ok(())
     }
+
+    /// Converts this instance into a `Job`.
+    fn into_job(&self) -> Job<E>;
 }
 
-/// Bookkeeping information about a scheduled job
-struct ScheduleEntry<J: Job> {
+impl_downcast!(IntoJob<E>);
 
-    /// Current state of corresponding job
-    state: JobState<J>,
-
-    /// List of jobs upon which this job depends
+/// Bookkeeping for individual job during planning
+struct PlanBuilderEntry<E> {
+    job: Rc<dyn IntoJob<E>>,
     dependencies: Vec<usize>,
-
-    /// List of jobs which depend on this job
     dependents: Vec<usize>,
 }
 
-impl<J: Job> ScheduleEntry<J> {
-
-    /// Returns a reference to the job held by this entry
-    ///
-    /// # Panics
-    ///
-    /// Panics if this is any other state besides `Pending`
-    fn job(&self) -> &J {
-        if let JobState::Pending(ref j) = self.state {
-            j
-        } else {
-            panic!("unexpected job state")
-        }
-    }
-}
-
-impl<J: Job> From<J> for ScheduleEntry<J> {
-    fn from(job: J) -> Self {
-        Self {
-            state: JobState::Pending(job),
-            dependencies: Default::default(),
-            dependents: Default::default(),
-        }
-    }
-}
-
-/// Data structure used to schedule execution of dependent jobs
-struct Schedule<J: Job> {
-
-    /// List of jobs which comprise this schedule
-    jobs: Vec<ScheduleEntry<J>>,
-
-    /// List of jobs that are ready to execute
+/// An "under construction" execution plan
+pub struct PlanBuilder<E> {
+    jobs: Vec<PlanBuilderEntry<E>>,
+    ancestors: HashSet<usize>,
+    current_parent: usize,
     ready: Vec<usize>,
 }
 
-impl<J: Job> Schedule<J> {
+impl<E: 'static> PlanBuilder<E> {
+    /// Checks for a matching entry in `self.jobs` and returns its index.
+    fn index_of<J: IntoJob<E> + PartialEq>(&self, job: &J) -> Option<usize> {
+        for (idx, entry) in self.jobs.iter().enumerate() {
+            if let Some(existing_job) = entry.job.downcast_ref::<J>() {
+                if job == existing_job {
+                    return Some(idx);
+                }
+            }
+        }
 
-    /// Creates a new schedule for executing `job` and its dependencies
-    fn new(job: J) -> Result<Self, Error<J::Error>> {
-
-        let mut sched = Self {
-            jobs: Default::default(),
-            ready: Default::default(),
-        };
-
-        let mut ancestors = Default::default();
-
-        sched.add_job(job, &mut ancestors)?;
-
-        Ok(sched)
+        None
     }
 
-    /// Adds `job` and its dependencies to this schedule
-    ///
-    /// `ancestors` is used to detect and reject dependency cycles.
-    fn add_job(&mut self, job: J, ancestors: &mut HashSet<usize>) -> Result<usize, Error<J::Error>> {
+    /// Adds `job` to the job plan as a dependency of the current job.
+    pub fn add_dependency<J: IntoJob<E> + PartialEq>(&mut self, job: J) -> Result<(), Error<E>> {
+        // This is where the magic happens. This method performs a *partial* topological sort (aka
+        // "dependency resolution" or "dependency ordering") of `job` and all its dependencies. We
+        // say *partial* because instead of a complete ordering of jobs this implementation produces
+        // a "ready queue" (`self.ready`) containing only the jobs which are currently ready to run.
+        //
+        // The reason for this difference is that it simplifies the implementation of parallel job
+        // scheduling. When the scheduler has capacity to run a new job, the next one is simply
+        // pulled from the ready queue without needing to iterate over the full list of jobs to
+        // check dependencies.
 
-        let job_idx = self.jobs.len();
-        self.jobs.push(job.into());
+        // If this job is already part of the job plan, get its index and add it
+        // as a dependency of the current parent.
+        if let Some(idx) = self.index_of(&job) {
+            if self.ancestors.contains(&idx) {
+                return Err(Error::Cycle);
+            }
 
-        assert!(ancestors.insert(job_idx));
-
-        for dep in self.jobs[job_idx].job().dependencies() {
-
-            let dep_idx = self.jobs.iter().position(|j| j.job() == &dep)
-                .map(|i| if ancestors.contains(&i) { Err(Error::Cycle) } else { Ok(i) })
-                .unwrap_or_else(|| self.add_job(dep, ancestors))?;
-
-            self.jobs[dep_idx].dependents.push(job_idx);
-            self.jobs[job_idx].dependencies.push(dep_idx);
+            self.jobs[idx].dependents.push(self.current_parent);
+            self.jobs[self.current_parent].dependencies.push(idx);
+            return Ok(());
         }
 
-        assert!(ancestors.remove(&job_idx));
+        // If we haven't seen this job before, add an entry for it. Then call plan() recursively to
+        // get its dependencies and other job information.
 
-        if self.jobs[job_idx].dependencies.len() == 0 {
-            self.ready.push(job_idx);
+        let idx = self.jobs.len();
+        let job = Rc::new(job);
+        self.jobs.push(PlanBuilderEntry {
+            job: job.clone(),
+            dependencies: vec![],
+            dependents: vec![self.current_parent],
+        });
+        self.jobs[self.current_parent].dependencies.push(idx);
+
+        self.ancestors.insert(idx);
+        let prev_parent = mem::replace(&mut self.current_parent, idx);
+        job.plan(self)?;
+        self.current_parent = prev_parent;
+        self.ancestors.remove(&idx);
+
+        if self.jobs[idx].dependencies.is_empty() {
+            self.ready.push(idx);
         }
 
-        Ok(job_idx)
+        Ok(())
+    }
+}
+
+/// Possible state of a job during execution
+enum State<E> {
+    Pending(Job<E>),
+    Running,
+    Success(Outcome),
+    Failed(E),
+}
+
+impl<E> State<E> {
+    /// Returns `true` if this is an instance of `Success`.
+    fn success(&self) -> bool {
+        match self {
+            State::Success(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Bookkeeping for individual job during execution
+struct PlanEntry<E> {
+    state: State<E>,
+    dependencies: Vec<usize>,
+    dependents: Vec<usize>,
+}
+
+/// A ready-to-execute job execution plan
+struct Plan<E> {
+    jobs: Vec<PlanEntry<E>>,
+    ready: Vec<usize>,
+}
+
+impl<E> Plan<E> {
+    /// Creates a new plan for executing `job` and its dependencies.
+    fn new<J: IntoJob<E>>(job: J) -> Result<Self, Error<E>> {
+        let job = Rc::new(job);
+
+        let mut builder = PlanBuilder {
+            jobs: vec![PlanBuilderEntry {
+                job: job.clone(),
+                dependencies: vec![],
+                dependents: vec![],
+            }],
+            ancestors: HashSet::from_iter([0].iter().cloned()),
+            current_parent: 0,
+            ready: vec![],
+        };
+
+        job.plan(&mut builder)?;
+        if builder.jobs[0].dependencies.is_empty() {
+            builder.ready.push(0);
+        }
+
+        Ok(Self {
+            jobs: builder
+                .jobs
+                .drain(..)
+                .map(|e| PlanEntry {
+                    state: State::Pending(e.job.into_job()),
+                    dependencies: e.dependencies,
+                    dependents: e.dependents,
+                })
+                .collect(),
+            ready: builder.ready,
+        })
     }
 
     /// Returns the next job from the ready queue, along with its index
-    fn next_job(&mut self) -> Option<(J, usize)> {
-
+    fn next_job(&mut self) -> Option<(Job<E>, usize)> {
         if self.ready.len() == 0 {
             return None;
         }
 
         let idx = self.ready.remove(0);
-        let state = mem::replace(&mut self.jobs[idx].state, JobState::Running);
+        let state = mem::replace(&mut self.jobs[idx].state, State::Running);
 
-        if let JobState::Pending(job) = state {
+        if let State::Pending(job) = state {
             Some((job, idx))
         } else {
             panic!("unexpected job status")
@@ -241,16 +259,17 @@ impl<J: Job> Schedule<J> {
 
     /// Marks a job as completed and updates the ready queue with any new jobs that
     /// are now ready to execute as a result.
-    fn mark_complete(&mut self, job_idx: usize, res: Result<Outcome, J::Error>) {
-
+    fn mark_complete(&mut self, job_idx: usize, res: Result<Outcome, E>) {
         self.jobs[job_idx].state = match res {
-            Ok(outcome) => JobState::Succeeded(outcome),
-            Err(err)    => JobState::Failed(err),
+            Ok(outcome) => State::Success(outcome),
+            Err(err) => State::Failed(err),
         };
 
         for dep_idx in &self.jobs[job_idx].dependents {
-            let is_ready = self.jobs[*dep_idx].dependencies.iter()
-                .all(|i| self.jobs[*i].state.succeeded());
+            let is_ready = self.jobs[*dep_idx]
+                .dependencies
+                .iter()
+                .all(|i| self.jobs[*i].state.success());
             if is_ready {
                 self.ready.push(*dep_idx);
             }
@@ -261,53 +280,27 @@ impl<J: Job> Schedule<J> {
 /// Schedules execution of jobs and dependencies
 ///
 /// Uses the builder pattern to configure various aspects of job execution.
-///
-/// ```
-/// use async_jobs::{Job, Outcome, Scheduler};
-/// use async_trait::async_trait;
-///
-/// #[derive(PartialEq)]
-/// struct MyJob(String);
-///
-/// #[async_trait]
-/// impl Job for MyJob {
-///
-///     type Error = ();
-///
-///     async fn run(&self) -> Result<Outcome, Self::Error> {
-///         println!("message: {}", self.0);
-///         Ok(Outcome::Success)
-///     }
-///
-///     fn dependencies(&self) -> Vec<Self> { vec![] }
-/// }
-///
-/// Scheduler::default()
-///     .run(MyJob("hello, world".into()));
-/// ```
 #[derive(Default)]
 pub struct Scheduler(());
 
 impl Scheduler {
-
     /// Executes `job` and its dependencies
-    pub async fn run<J: Job>(&self, job: J) -> Result<(), Error<J::Error>> {
+    pub async fn run<E, J: IntoJob<E>>(&self, job: J) -> Result<(), Error<E>> {
+        let mut plan = Plan::new(job)?;
 
-        let mut sched = Schedule::new(job)?;
-
-        while let Some((job, idx)) = sched.next_job() {
-            sched.mark_complete(idx, job.run().await);
+        while let Some((job, idx)) = plan.next_job() {
+            plan.mark_complete(idx, job().await);
         }
 
         let mut errs = vec![];
-        for job in sched.jobs {
-            if let JobState::Failed(err) = job.state {
+        for job in plan.jobs {
+            if let State::Failed(err) = job.state {
                 errs.push(err);
             }
         }
 
         if errs.len() > 0 {
-            Err(Error::Fail(errs))
+            Err(Error::Failed(errs))
         } else {
             Ok(())
         }
@@ -323,72 +316,66 @@ mod tests {
 
     type TestGraph = Vec<(bool, Vec<usize>)>;
 
-    struct TestJob<'a> {
+    struct TestJob {
         index: usize,
-        graph: &'a TestGraph,
-        trace: &'a Mutex<Vec<usize>>,
+        graph: Rc<TestGraph>,
+        trace: Rc<Mutex<Vec<usize>>>,
         success: bool,
     }
 
-    #[async_trait]
-    impl<'a> Job for TestJob<'a> {
-
-        type Error = usize;
-
-        fn dependencies(&self) -> Vec<Self> {
-
-            let mut deps = vec![];
-
+    impl IntoJob<usize> for TestJob {
+        fn plan(&self, plan: &mut PlanBuilder<usize>) -> Result<(), Error<usize>> {
             for index in &self.graph[self.index].1 {
-                deps.push(TestJob {
+                plan.add_dependency(TestJob {
                     index: *index,
-                    graph: self.graph,
-                    trace: self.trace,
+                    graph: self.graph.clone(),
+                    trace: self.trace.clone(),
                     success: self.graph[*index].0,
-                })
+                })?;
             }
 
-            deps
+            Ok(())
         }
 
-        async fn run(&self) -> Result<Outcome, Self::Error> {
-
-            self.trace.lock().await
-                .push(self.index);
-
-            if self.success {
-                Ok(Outcome::Success)
-            } else {
-                Err(self.index)
-            }
+        fn into_job(&self) -> Job<usize> {
+            let trace = self.trace.clone();
+            let success = self.success;
+            let index = self.index;
+            Box::new(move || {
+                Box::pin(async move {
+                    trace.lock().await.push(index);
+                    if success {
+                        Ok(Outcome::Success)
+                    } else {
+                        Err(index)
+                    }
+                })
+            })
         }
     }
 
-    impl<'a> PartialEq for TestJob<'a> {
+    impl PartialEq for TestJob {
         fn eq(&self, other: &Self) -> bool {
             self.index == other.index
         }
     }
 
     async fn trace(graph: TestGraph) -> (Vec<Option<usize>>, Option<Error<usize>>) {
-
-        let trace = Mutex::new(vec![]);
+        let graph = Rc::new(graph);
+        let trace = Rc::new(Mutex::new(vec![]));
         let job = TestJob {
             index: 0,
-            graph: &graph,
-            trace: &trace,
+            graph: graph.clone(),
+            trace: trace.clone(),
             success: graph[0].0,
         };
 
         let sched = Scheduler::default();
-        let err = sched.run(job)
-            .await
-            .err();
+        let err = sched.run(job).await.err();
 
         let mut results = vec![None; graph.len()];
 
-        for (finished_idx, job_idx) in trace.into_inner().iter().enumerate() {
-
+        for (finished_idx, job_idx) in trace.lock().await.iter().enumerate() {
             // Ensure no job has had its update method called more than once
             assert!(results[*job_idx].is_none());
 
@@ -400,10 +387,7 @@ mod tests {
 
     #[async_std::test]
     async fn single_job() {
-
-        let (trace, err) = trace(vec![
-            (true, vec![]),
-        ]).await;
+        let (trace, err) = trace(vec![(true, vec![])]).await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(0));
@@ -411,22 +395,15 @@ mod tests {
 
     #[async_std::test]
     async fn single_job_fails() {
+        let (trace, err) = trace(vec![(false, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (false, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![0])));
+        assert_eq!(err, Some(Error::Failed(vec![0])));
         assert_eq!(trace[0], Some(0));
     }
 
     #[async_std::test]
     async fn single_dep() {
-
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (true, vec![]),
-        ]).await;
+        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![])]).await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(1));
@@ -435,38 +412,25 @@ mod tests {
 
     #[async_std::test]
     async fn single_dep_fails() {
+        let (trace, err) = trace(vec![(true, vec![1]), (false, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (false, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![1])));
+        assert_eq!(err, Some(Error::Failed(vec![1])));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], Some(0));
     }
 
     #[async_std::test]
     async fn single_dep_root_fails() {
+        let (trace, err) = trace(vec![(false, vec![1]), (true, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (false, vec![1]),
-            (true, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![0])));
+        assert_eq!(err, Some(Error::Failed(vec![0])));
         assert_eq!(trace[0], Some(1));
         assert_eq!(trace[1], Some(0));
     }
 
     #[async_std::test]
     async fn two_deps() {
-
-        let (trace, err) = trace(vec![
-            (true, vec![1, 2]),
-            (true, vec![]),
-            (true, vec![]),
-        ]).await;
+        let (trace, err) = trace(vec![(true, vec![1, 2]), (true, vec![]), (true, vec![])]).await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
@@ -476,14 +440,9 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_one_fails() {
+        let (trace, err) = trace(vec![(true, vec![1, 2]), (true, vec![]), (false, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (true, vec![1, 2]),
-            (true, vec![]),
-            (false, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![2])));
+        assert_eq!(err, Some(Error::Failed(vec![2])));
         assert_eq!(trace[0], None);
         // job 1 may or may not be updated
         assert!(trace[2].is_some());
@@ -491,12 +450,7 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep() {
-
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (true, vec![2]),
-            (true, vec![]),
-        ]).await;
+        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![2]), (true, vec![])]).await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
@@ -506,14 +460,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep_fails() {
+        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![2]), (false, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (true, vec![2]),
-            (false, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![2])));
+        assert_eq!(err, Some(Error::Failed(vec![2])));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], None);
         assert_eq!(trace[2], Some(0));
@@ -521,14 +470,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep_direct_dep_fails() {
+        let (trace, err) = trace(vec![(true, vec![1]), (false, vec![2]), (true, vec![])]).await;
 
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (false, vec![2]),
-            (true, vec![]),
-        ]).await;
-
-        assert_eq!(err, Some(Error::Fail(vec![1])));
+        assert_eq!(err, Some(Error::Failed(vec![1])));
         assert_eq!(trace[0], None);
         assert_eq!(trace[1], Some(1));
         assert_eq!(trace[2], Some(0));
@@ -536,13 +480,13 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_single_trans_dep() {
-
         let (trace, err) = trace(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
             (true, vec![]),
-        ]).await;
+        ])
+        .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
@@ -556,14 +500,14 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_each_with_trans_dep() {
-
         let (trace, err) = trace(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
             (true, vec![4]),
             (true, vec![]),
-        ]).await;
+        ])
+        .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(4));
@@ -583,13 +527,13 @@ mod tests {
 
     #[async_std::test]
     async fn three_deps() {
-
         let (trace, err) = trace(vec![
             (true, vec![1, 2, 3]),
             (true, vec![]),
             (true, vec![]),
             (true, vec![]),
-        ]).await;
+        ])
+        .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
@@ -600,13 +544,13 @@ mod tests {
 
     #[async_std::test]
     async fn diamond() {
-
         let (trace, err) = trace(vec![
             (true, vec![2, 3]),
             (true, vec![]),
             (true, vec![1]),
             (true, vec![1]),
-        ]).await;
+        ])
+        .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(3));
@@ -622,7 +566,6 @@ mod tests {
 
     #[async_std::test]
     async fn diamond_with_extra_trans_deps() {
-
         let (trace, err) = trace(vec![
             (true, vec![2, 3]),
             (true, vec![4]),
@@ -631,7 +574,8 @@ mod tests {
             (true, vec![]),
             (true, vec![]),
             (true, vec![]),
-        ]).await;
+        ])
+        .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(6));
@@ -658,11 +602,7 @@ mod tests {
 
     #[async_std::test]
     async fn simple_cycle() {
-
-        let (trace, err) = trace(vec![
-            (true, vec![1]),
-            (true, vec![0]),
-        ]).await;
+        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![0])]).await;
 
         assert_eq!(err, Some(Error::Cycle));
         for job in trace {
@@ -672,13 +612,13 @@ mod tests {
 
     #[async_std::test]
     async fn complex_cycle() {
-
         let (trace, err) = trace(vec![
             (true, vec![1, 2]),
             (true, vec![3]),
             (true, vec![1]),
             (true, vec![2]),
-        ]).await;
+        ])
+        .await;
 
         assert_eq!(err, Some(Error::Cycle));
         for job in trace {

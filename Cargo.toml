@@ -12,7 +12,7 @@ keywords = ["async", "job", "dependency", "graph"]
 categories = ["algorithms", "asynchronous", "concurrency"]
 
 [dependencies]
-async-trait = "0.1"
+downcast-rs = "1.2"
 
 [dev-dependencies]
 async-std = { version = "1.6", features = ["attributes"] }
