@@ -43,7 +43,7 @@
 //!     }
 //! }
 //!
-//! let sched = Scheduler::default();
+//! let sched = Scheduler::new();
 //! async_std::task::block_on(sched.run(Bar(7)));
 //! ```
 
@@ -55,6 +55,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use downcast_rs::{impl_downcast, Downcast};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 /// Possible job outcomes
 #[non_exhaustive]
@@ -99,8 +100,8 @@ impl_downcast!(IntoJob<E>);
 /// Bookkeeping for individual job during planning
 struct PlanBuilderEntry<E> {
     job: Rc<dyn IntoJob<E>>,
-    dependencies: Vec<usize>,
-    dependents: Vec<usize>,
+    dependencies: HashSet<usize>,
+    dependents: HashSet<usize>,
 }
 
 /// An "under construction" execution plan
@@ -144,8 +145,8 @@ impl<E: 'static> PlanBuilder<E> {
                 return Err(Error::Cycle);
             }
 
-            self.jobs[idx].dependents.push(self.current_parent);
-            self.jobs[self.current_parent].dependencies.push(idx);
+            self.jobs[idx].dependents.insert(self.current_parent);
+            self.jobs[self.current_parent].dependencies.insert(idx);
             return Ok(());
         }
 
@@ -156,10 +157,10 @@ impl<E: 'static> PlanBuilder<E> {
         let job = Rc::new(job);
         self.jobs.push(PlanBuilderEntry {
             job: job.clone(),
-            dependencies: vec![],
-            dependents: vec![self.current_parent],
+            dependencies: HashSet::new(),
+            dependents: HashSet::from_iter(vec![self.current_parent]),
         });
-        self.jobs[self.current_parent].dependencies.push(idx);
+        self.jobs[self.current_parent].dependencies.insert(idx);
 
         self.ancestors.insert(idx);
         let prev_parent = mem::replace(&mut self.current_parent, idx);
@@ -196,8 +197,8 @@ impl<E> State<E> {
 /// Bookkeeping for individual job during execution
 struct PlanEntry<E> {
     state: State<E>,
-    dependencies: Vec<usize>,
-    dependents: Vec<usize>,
+    dependencies: HashSet<usize>,
+    dependents: HashSet<usize>,
 }
 
 /// A ready-to-execute job execution plan
@@ -214,10 +215,10 @@ impl<E> Plan<E> {
         let mut builder = PlanBuilder {
             jobs: vec![PlanBuilderEntry {
                 job: job.clone(),
-                dependencies: vec![],
-                dependents: vec![],
+                dependencies: HashSet::new(),
+                dependents: HashSet::new(),
             }],
-            ancestors: HashSet::from_iter([0].iter().cloned()),
+            ancestors: HashSet::from_iter(vec![0]),
             current_parent: 0,
             ready: vec![],
         };
@@ -280,16 +281,61 @@ impl<E> Plan<E> {
 /// Schedules execution of jobs and dependencies
 ///
 /// Uses the builder pattern to configure various aspects of job execution.
-#[derive(Default)]
-pub struct Scheduler(());
+pub struct Scheduler {
+    max_jobs: usize,
+}
 
 impl Scheduler {
-    /// Executes `job` and its dependencies
+    /// Creates a new scheduler instance.
+    pub fn new() -> Self {
+        let max_jobs = num_cpus::get();
+        Self { max_jobs }
+    }
+
+    /// Sets the maximum number of jobs that can be run concurrently. Defaults to the number of
+    /// logical CPUs available to the current process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `jobs` is zero.
+    pub fn max_jobs(&mut self, jobs: usize) -> &mut Self {
+        if jobs == 0 {
+            panic!("max_jobs must be greater than zero")
+        }
+        self.max_jobs = jobs;
+        self
+    }
+
+    /// Executes `job` and its dependencies.
     pub async fn run<E, J: IntoJob<E>>(&self, job: J) -> Result<(), Error<E>> {
         let mut plan = Plan::new(job)?;
+        let mut pool = FuturesUnordered::new();
 
-        while let Some((job, idx)) = plan.next_job() {
-            plan.mark_complete(idx, job().await);
+        loop {
+            // Add jobs to the pool, stopping either when the pool is full or there are no more jobs
+            // ready to be executed.
+            while pool.len() < self.max_jobs {
+                if let Some((job, idx)) = plan.next_job() {
+                    pool.push(async move {
+                        let res = job().await;
+                        (idx, res)
+                    })
+                } else {
+                    break;
+                }
+            }
+
+            if pool.len() == 0 {
+                // No jobs ready to execute and no jobs pending. Either we've finished everything or
+                // there was some failure. Either way, we aren't going to get any farther.
+                break;
+            }
+
+            if let Some((idx, res)) = pool.next().await {
+                plan.mark_complete(idx, res);
+            } else {
+                panic!("job pool unexpectedly empty");
+            }
         }
 
         let mut errs = vec![];
@@ -310,15 +356,21 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
 
+    use std::time::{Duration, Instant};
+
     use async_std::sync::Mutex;
+    use async_std::task;
 
     use super::*;
 
-    type TestGraph = Vec<(bool, Vec<usize>)>;
+    struct TestPlan {
+        graph: Vec<(bool, Vec<usize>)>,
+        max_jobs: Option<usize>,
+    }
 
     struct TestJob {
         index: usize,
-        graph: Rc<TestGraph>,
+        graph: Rc<Vec<(bool, Vec<usize>)>>,
         trace: Rc<Mutex<Vec<usize>>>,
         success: bool,
     }
@@ -360,34 +412,47 @@ mod tests {
         }
     }
 
-    async fn trace(graph: TestGraph) -> (Vec<Option<usize>>, Option<Error<usize>>) {
-        let graph = Rc::new(graph);
-        let trace = Rc::new(Mutex::new(vec![]));
-        let job = TestJob {
-            index: 0,
-            graph: graph.clone(),
-            trace: trace.clone(),
-            success: graph[0].0,
-        };
-
-        let sched = Scheduler::default();
-        let err = sched.run(job).await.err();
-
-        let mut results = vec![None; graph.len()];
-
-        for (finished_idx, job_idx) in trace.lock().await.iter().enumerate() {
-            // Ensure no job has had its update method called more than once
-            assert!(results[*job_idx].is_none());
-
-            results[*job_idx] = Some(finished_idx);
+    impl TestPlan {
+        fn new(graph: Vec<(bool, Vec<usize>)>) -> Self {
+            Self {
+                graph,
+                max_jobs: None,
+            }
         }
 
-        (results, err)
+        async fn trace(self) -> (Vec<Option<usize>>, Option<Error<usize>>) {
+            let graph = Rc::new(self.graph);
+            let trace = Rc::new(Mutex::new(vec![]));
+            let job = TestJob {
+                index: 0,
+                graph: graph.clone(),
+                trace: trace.clone(),
+                success: graph[0].0,
+            };
+
+            let mut sched = Scheduler::new();
+            if let Some(max_jobs) = self.max_jobs {
+                sched.max_jobs(max_jobs);
+            }
+
+            let err = sched.run(job).await.err();
+
+            let mut results = vec![None; graph.len()];
+
+            for (finished_idx, job_idx) in trace.lock().await.iter().enumerate() {
+                // Ensure no job has had its update method called more than once
+                assert!(results[*job_idx].is_none());
+
+                results[*job_idx] = Some(finished_idx);
+            }
+
+            (results, err)
+        }
     }
 
     #[async_std::test]
     async fn single_job() {
-        let (trace, err) = trace(vec![(true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![])]).trace().await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(0));
@@ -395,7 +460,7 @@ mod tests {
 
     #[async_std::test]
     async fn single_job_fails() {
-        let (trace, err) = trace(vec![(false, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(false, vec![])]).trace().await;
 
         assert_eq!(err, Some(Error::Failed(vec![0])));
         assert_eq!(trace[0], Some(0));
@@ -403,7 +468,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_dep() {
-        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (true, vec![])])
+            .trace()
+            .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(1));
@@ -412,7 +479,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_dep_fails() {
-        let (trace, err) = trace(vec![(true, vec![1]), (false, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (false, vec![])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Failed(vec![1])));
         assert_eq!(trace[0], None);
@@ -421,7 +490,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_dep_root_fails() {
-        let (trace, err) = trace(vec![(false, vec![1]), (true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(false, vec![1]), (true, vec![])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Failed(vec![0])));
         assert_eq!(trace[0], Some(1));
@@ -430,7 +501,9 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps() {
-        let (trace, err) = trace(vec![(true, vec![1, 2]), (true, vec![]), (true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1, 2]), (true, vec![]), (true, vec![])])
+            .trace()
+            .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
@@ -440,7 +513,9 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_one_fails() {
-        let (trace, err) = trace(vec![(true, vec![1, 2]), (true, vec![]), (false, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1, 2]), (true, vec![]), (false, vec![])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Failed(vec![2])));
         assert_eq!(trace[0], None);
@@ -450,7 +525,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep() {
-        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![2]), (true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (true, vec![2]), (true, vec![])])
+            .trace()
+            .await;
 
         assert!(err.is_none());
         assert_eq!(trace[0], Some(2));
@@ -460,7 +537,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep_fails() {
-        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![2]), (false, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (true, vec![2]), (false, vec![])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Failed(vec![2])));
         assert_eq!(trace[0], None);
@@ -470,7 +549,9 @@ mod tests {
 
     #[async_std::test]
     async fn single_trans_dep_direct_dep_fails() {
-        let (trace, err) = trace(vec![(true, vec![1]), (false, vec![2]), (true, vec![])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (false, vec![2]), (true, vec![])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Failed(vec![1])));
         assert_eq!(trace[0], None);
@@ -480,12 +561,13 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_single_trans_dep() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
             (true, vec![]),
         ])
+        .trace()
         .await;
 
         assert!(err.is_none());
@@ -500,13 +582,14 @@ mod tests {
 
     #[async_std::test]
     async fn two_deps_each_with_trans_dep() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![1, 3]),
             (true, vec![2]),
             (true, vec![]),
             (true, vec![4]),
             (true, vec![]),
         ])
+        .trace()
         .await;
 
         assert!(err.is_none());
@@ -527,12 +610,13 @@ mod tests {
 
     #[async_std::test]
     async fn three_deps() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![1, 2, 3]),
             (true, vec![]),
             (true, vec![]),
             (true, vec![]),
         ])
+        .trace()
         .await;
 
         assert!(err.is_none());
@@ -544,12 +628,13 @@ mod tests {
 
     #[async_std::test]
     async fn diamond() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![2, 3]),
             (true, vec![]),
             (true, vec![1]),
             (true, vec![1]),
         ])
+        .trace()
         .await;
 
         assert!(err.is_none());
@@ -566,7 +651,7 @@ mod tests {
 
     #[async_std::test]
     async fn diamond_with_extra_trans_deps() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![2, 3]),
             (true, vec![4]),
             (true, vec![1, 5]),
@@ -575,6 +660,7 @@ mod tests {
             (true, vec![]),
             (true, vec![]),
         ])
+        .trace()
         .await;
 
         assert!(err.is_none());
@@ -602,7 +688,9 @@ mod tests {
 
     #[async_std::test]
     async fn simple_cycle() {
-        let (trace, err) = trace(vec![(true, vec![1]), (true, vec![0])]).await;
+        let (trace, err) = TestPlan::new(vec![(true, vec![1]), (true, vec![0])])
+            .trace()
+            .await;
 
         assert_eq!(err, Some(Error::Cycle));
         for job in trace {
@@ -612,17 +700,67 @@ mod tests {
 
     #[async_std::test]
     async fn complex_cycle() {
-        let (trace, err) = trace(vec![
+        let (trace, err) = TestPlan::new(vec![
             (true, vec![1, 2]),
             (true, vec![3]),
             (true, vec![1]),
             (true, vec![2]),
         ])
+        .trace()
         .await;
 
         assert_eq!(err, Some(Error::Cycle));
         for job in trace {
             assert_eq!(job, None);
         }
+    }
+
+    #[async_std::test]
+    async fn concurrent_execution() {
+        // We validate that the implementation correctly runs jobs concurrently by running two jobs
+        // which sleep for a fixed period of time. If the overall execution time is less than the
+        // sum of the individual SleepJobs, we know for sure that some work was performed
+        // concurrently.
+        //
+        // It's theoretically possible that the runtime or operating system could schedule things
+        // in such a way that the timing doesn't work out, causing this test to fail even though the
+        // implementation is correct. Seems very unlikely unless the system is under exceptional
+        // pressure. Concurrency is hard; I'm certainly open to a better method of testing.
+
+        #[derive(PartialEq)]
+        struct SleepJob(Duration);
+        impl IntoJob<()> for SleepJob {
+            fn into_job(&self) -> Job<()> {
+                let dur = self.0;
+                Box::new(move || Box::pin(async move {
+                    task::sleep(dur).await;
+                    Ok(Outcome::Success)
+                }))
+            }
+        }
+
+        struct PseudoJob;
+        impl IntoJob<()> for PseudoJob {
+            fn plan(&self, plan: &mut PlanBuilder<()>) -> Result<(), Error<()>> {
+                plan.add_dependency(SleepJob(Duration::from_millis(60)))?;
+                plan.add_dependency(SleepJob(Duration::from_millis(80)))?;
+                Ok(())
+            }
+            fn into_job(&self) -> Job<()> {
+                Box::new(|| Box::pin(async {
+                    Ok(Outcome::Success)
+                }))
+            }
+        }
+
+        let mut sched = Scheduler::new();
+        sched.max_jobs(2);
+
+        let start = Instant::now();
+        let res = sched.run(PseudoJob).await;
+        let end = Instant::now();
+
+        assert!(res.is_ok());
+        assert!(end - start < Duration::from_millis(140));
     }
 }

@@ -13,6 +13,8 @@ categories = ["algorithms", "asynchronous", "concurrency"]
 
 [dependencies]
 downcast-rs = "1.2"
+futures = "0.3"
+num_cpus = "1.13"
 
 [dev-dependencies]
 async-std = { version = "1.6", features = ["attributes"] }
