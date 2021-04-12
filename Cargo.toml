@@ -1,6 +1,6 @@
 [package]
 name = "async-jobs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Bobby Reynolds <bobby@reynoldsbd.net>"]
 edition = "2018"
 description = "Asynchronous job orchestration for Rust"
@@ -12,7 +12,9 @@ keywords = ["async", "job", "dependency", "graph"]
 categories = ["algorithms", "asynchronous", "concurrency"]
 
 [dependencies]
-async-trait = "0.1"
+downcast-rs = "1.2"
+futures = "0.3"
+num_cpus = "1.13"
 
 [dev-dependencies]
 async-std = { version = "1.6", features = ["attributes"] }
