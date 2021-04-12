@@ -6,6 +6,12 @@
 //! The main way to use this crate is by creating implementations of the `IntoJob` trait to describe
 //! the tasks in your program and how they depend on one another. To run your jobs, create a
 //! `Scheduler` and pass a job to its `run` method.
+//! 
+//! Jobs are generic over the types `C` and `E`, which are the user-defined context and error types,
+//! respectively. The context mechanism provides a means for all jobs to access some shared bit of
+//! data; see `Scheduler` for more information. The error type allows jobs to return an arbitrary
+//! error value that is propagated up through the scheduler. Note that all jobs within the same job
+//! graph must use the same types for `C` and `E`.
 //!
 //! # Example
 //!
@@ -14,10 +20,10 @@
 //! #[derive(PartialEq)]
 //! struct Foo(usize);
 //!
-//! impl IntoJob<()> for Foo {
-//!     fn into_job(&self) -> Job<()> {
+//! impl IntoJob<(), ()> for Foo {
+//!     fn into_job(&self) -> Job<(), ()> {
 //!         let num = self.0;
-//!         Box::new(move || Box::pin(async move {
+//!         Box::new(move |_| Box::pin(async move {
 //!             println!("foo: {}", num);
 //!             Ok(Outcome::Success)
 //!         }))
@@ -27,23 +33,23 @@
 //! #[derive(PartialEq)]
 //! struct Bar(usize);
 //!
-//! impl IntoJob<()> for Bar {
-//!     fn plan(&self, plan: &mut PlanBuilder<()>) -> Result<(), Error<()>> {
+//! impl IntoJob<(), ()> for Bar {
+//!     fn plan(&self, plan: &mut PlanBuilder<(), ()>) -> Result<(), Error<()>> {
 //!         plan.add_dependency(Foo(self.0 + 1))?;
 //!         plan.add_dependency(Foo(self.0 + 2))?;
 //!         Ok(())
 //!     }
 //!
-//!     fn into_job(&self) -> Job<()> {
+//!     fn into_job(&self) -> Job<(), ()> {
 //!         let num = self.0;
-//!         Box::new(move || Box::pin(async move {
+//!         Box::new(move |_| Box::pin(async move {
 //!             println!("bar: {}", num);
 //!             Ok(Outcome::Success)
 //!         }))
 //!     }
 //! }
 //!
-//! let sched = Scheduler::new();
+//! let mut sched = Scheduler::new();
 //! async_std::task::block_on(sched.run(Bar(7)));
 //! ```
 
@@ -78,43 +84,77 @@ pub enum Error<E> {
 }
 
 /// Unit of asynchronous work
-pub type Job<E> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Outcome, E>>>>>;
+/// 
+/// Note that this is just a type alias for a big nasty trait object which is used internally to
+/// track and execute jobs.
+/// 
+/// The following snippet shows how to construct a `Job` manually. This is probably what you want to
+/// do if you're implementing `IntoJob::into_job`. Depending on the circumstances, you may need to
+/// add the `move` keyword before the first closure.
+/// 
+/// ```
+/// # use async_jobs::{Job, Outcome};
+/// let my_job: Job<(), ()> = Box::new(|ctx| Box::pin(async move {
+///     // your async code here
+///     Ok(Outcome::Success)
+/// }));
+/// ```
+pub type Job<C, E> = Box<dyn FnOnce(C) -> Pin<Box<dyn Future<Output = Result<Outcome, E>>>>>;
 
 /// Information needed to schedule and execute a job
-pub trait IntoJob<E>: Downcast {
+///
+/// This is the central trait of the `async-jobs` crate. It is used to define the different types of
+/// jobs that may appear in your job graph.
+/// 
+/// Each instance of `IntoJob` has two primary responsibilities. The first and most obvious is to
+/// return an instance of `Job` whenever the `into_job` method is called. The returned instance
+/// should perform the actual work associated with your job, and is guaranteed to be called no more
+/// than once.
+/// 
+/// The second responsibility is to provide the list of job dependencies when the `plan` method is
+/// called. This method is called once internally by the scheduler while preparing the job execution
+/// plan. It is passed a `PlanBuilder` reference and must call its methods to add dependencies.
+pub trait IntoJob<C, E>: Downcast {
+    /// Converts this instance into a `Job`.
+    fn into_job(&self) -> Job<C, E>;
+
     /// Configures the job plan with information about this job, such as its dependencies.
-    fn plan(&self, plan: &mut PlanBuilder<E>) -> Result<(), Error<E>> {
+    fn plan(&self, plan: &mut PlanBuilder<C, E>) -> Result<(), Error<E>> {
         // This default impl does not use the plan parameter, but we still want it to be named
         // "plan" in documentation.
         #![allow(unused_variables)]
 
         Ok(())
     }
-
-    /// Converts this instance into a `Job`.
-    fn into_job(&self) -> Job<E>;
 }
 
-impl_downcast!(IntoJob<E>);
+impl_downcast!(IntoJob<C, E>);
 
 /// Bookkeeping for individual job during planning
-struct PlanBuilderEntry<E> {
-    job: Rc<dyn IntoJob<E>>,
+struct PlanBuilderEntry<C, E> {
+    job: Rc<dyn IntoJob<C, E>>,
     dependencies: HashSet<usize>,
     dependents: HashSet<usize>,
 }
 
-/// An "under construction" execution plan
-pub struct PlanBuilder<E> {
-    jobs: Vec<PlanBuilderEntry<E>>,
+/// Representation of an "under construction" execution plan
+/// 
+/// `PlanBuilder` is a data structure used internally by the job scheduler to construct a
+/// [topologically-sorted][topo] job execution plan. Each individual `IntoJob` instance added to the
+/// plan is given access to a `&mut PlanBuilder` via its `plan` method which it can use to specify
+/// additional dependency jobs or make other customizations to the job graph before it is executed.
+/// 
+/// [topo]: https://en.wikipedia.org/wiki/Topological_sorting
+pub struct PlanBuilder<C, E> {
+    jobs: Vec<PlanBuilderEntry<C, E>>,
     ancestors: HashSet<usize>,
     current_parent: usize,
     ready: Vec<usize>,
 }
 
-impl<E: 'static> PlanBuilder<E> {
+impl<C: 'static, E: 'static> PlanBuilder<C, E> {
     /// Checks for a matching entry in `self.jobs` and returns its index.
-    fn index_of<J: IntoJob<E> + PartialEq>(&self, job: &J) -> Option<usize> {
+    fn index_of<J: IntoJob<C, E> + PartialEq>(&self, job: &J) -> Option<usize> {
         for (idx, entry) in self.jobs.iter().enumerate() {
             if let Some(existing_job) = entry.job.downcast_ref::<J>() {
                 if job == existing_job {
@@ -127,7 +167,7 @@ impl<E: 'static> PlanBuilder<E> {
     }
 
     /// Adds `job` to the job plan as a dependency of the current job.
-    pub fn add_dependency<J: IntoJob<E> + PartialEq>(&mut self, job: J) -> Result<(), Error<E>> {
+    pub fn add_dependency<J: IntoJob<C, E> + PartialEq>(&mut self, job: J) -> Result<(), Error<E>> {
         // This is where the magic happens. This method performs a *partial* topological sort (aka
         // "dependency resolution" or "dependency ordering") of `job` and all its dependencies. We
         // say *partial* because instead of a complete ordering of jobs this implementation produces
@@ -177,14 +217,14 @@ impl<E: 'static> PlanBuilder<E> {
 }
 
 /// Possible state of a job during execution
-enum State<E> {
-    Pending(Job<E>),
+enum State<C, E> {
+    Pending(Job<C, E>),
     Running,
     Success(Outcome),
     Failed(E),
 }
 
-impl<E> State<E> {
+impl<C, E> State<C, E> {
     /// Returns `true` if this is an instance of `Success`.
     fn success(&self) -> bool {
         match self {
@@ -195,21 +235,21 @@ impl<E> State<E> {
 }
 
 /// Bookkeeping for individual job during execution
-struct PlanEntry<E> {
-    state: State<E>,
+struct PlanEntry<C, E> {
+    state: State<C, E>,
     dependencies: HashSet<usize>,
     dependents: HashSet<usize>,
 }
 
 /// A ready-to-execute job execution plan
-struct Plan<E> {
-    jobs: Vec<PlanEntry<E>>,
+struct Plan<C, E> {
+    jobs: Vec<PlanEntry<C, E>>,
     ready: Vec<usize>,
 }
 
-impl<E> Plan<E> {
+impl<C, E> Plan<C, E> {
     /// Creates a new plan for executing `job` and its dependencies.
-    fn new<J: IntoJob<E>>(job: J) -> Result<Self, Error<E>> {
+    fn new<J: IntoJob<C, E>>(job: J) -> Result<Self, Error<E>> {
         let job = Rc::new(job);
 
         let mut builder = PlanBuilder {
@@ -243,7 +283,7 @@ impl<E> Plan<E> {
     }
 
     /// Returns the next job from the ready queue, along with its index
-    fn next_job(&mut self) -> Option<(Job<E>, usize)> {
+    fn next_job(&mut self) -> Option<(Job<C, E>, usize)> {
         if self.ready.len() == 0 {
             return None;
         }
@@ -281,15 +321,30 @@ impl<E> Plan<E> {
 /// Schedules execution of jobs and dependencies
 ///
 /// Uses the builder pattern to configure various aspects of job execution.
-pub struct Scheduler {
+pub struct Scheduler<'a, C> {
     max_jobs: usize,
+    ctx_factory: Box<dyn FnMut() -> C + 'a>,
 }
 
-impl Scheduler {
+impl Scheduler<'static, ()> {
     /// Creates a new scheduler instance.
     pub fn new() -> Self {
         let max_jobs = num_cpus::get();
-        Self { max_jobs }
+        let ctx_factory = Box::new(|| ());
+        Self { max_jobs, ctx_factory }
+    }
+}
+
+impl<'a, C> Scheduler<'a, C> {
+    /// Creates a new `Scheduler` using the given context factory. A separate context instance will
+    /// be created for each job.
+    pub fn with_factory<F>(factory: F) -> Self
+    where
+        F: FnMut() -> C + 'a
+    {
+        let max_jobs = num_cpus::get();
+        let ctx_factory = Box::new(factory);
+        Self { max_jobs, ctx_factory }
     }
 
     /// Sets the maximum number of jobs that can be run concurrently. Defaults to the number of
@@ -307,7 +362,7 @@ impl Scheduler {
     }
 
     /// Executes `job` and its dependencies.
-    pub async fn run<E, J: IntoJob<E>>(&self, job: J) -> Result<(), Error<E>> {
+    pub async fn run<E, J: IntoJob<C, E>>(&mut self, job: J) -> Result<(), Error<E>> {
         let mut plan = Plan::new(job)?;
         let mut pool = FuturesUnordered::new();
 
@@ -316,8 +371,9 @@ impl Scheduler {
             // ready to be executed.
             while pool.len() < self.max_jobs {
                 if let Some((job, idx)) = plan.next_job() {
+                    let ctx = (self.ctx_factory)();
                     pool.push(async move {
-                        let res = job().await;
+                        let res = job(ctx).await;
                         (idx, res)
                     })
                 } else {
@@ -363,6 +419,10 @@ mod tests {
 
     use super::*;
 
+    type JobGraph = Rc<Vec<(bool, Vec<usize>)>>;
+
+    type JobTrace = Rc<Mutex<Vec<usize>>>;
+
     struct TestPlan {
         graph: Vec<(bool, Vec<usize>)>,
         max_jobs: Option<usize>,
@@ -370,18 +430,16 @@ mod tests {
 
     struct TestJob {
         index: usize,
-        graph: Rc<Vec<(bool, Vec<usize>)>>,
-        trace: Rc<Mutex<Vec<usize>>>,
+        graph: JobGraph,
         success: bool,
     }
 
-    impl IntoJob<usize> for TestJob {
-        fn plan(&self, plan: &mut PlanBuilder<usize>) -> Result<(), Error<usize>> {
+    impl IntoJob<JobTrace, usize> for TestJob {
+        fn plan(&self, plan: &mut PlanBuilder<JobTrace, usize>) -> Result<(), Error<usize>> {
             for index in &self.graph[self.index].1 {
                 plan.add_dependency(TestJob {
                     index: *index,
                     graph: self.graph.clone(),
-                    trace: self.trace.clone(),
                     success: self.graph[*index].0,
                 })?;
             }
@@ -389,11 +447,10 @@ mod tests {
             Ok(())
         }
 
-        fn into_job(&self) -> Job<usize> {
-            let trace = self.trace.clone();
+        fn into_job(&self) -> Job<JobTrace, usize> {
             let success = self.success;
             let index = self.index;
-            Box::new(move || {
+            Box::new(move |trace| {
                 Box::pin(async move {
                     trace.lock().await.push(index);
                     if success {
@@ -422,15 +479,14 @@ mod tests {
 
         async fn trace(self) -> (Vec<Option<usize>>, Option<Error<usize>>) {
             let graph = Rc::new(self.graph);
-            let trace = Rc::new(Mutex::new(vec![]));
             let job = TestJob {
                 index: 0,
                 graph: graph.clone(),
-                trace: trace.clone(),
                 success: graph[0].0,
             };
 
-            let mut sched = Scheduler::new();
+            let trace = Rc::new(Mutex::new(vec![]));
+            let mut sched = Scheduler::with_factory(|| trace.clone());
             if let Some(max_jobs) = self.max_jobs {
                 sched.max_jobs(max_jobs);
             }
@@ -729,10 +785,10 @@ mod tests {
 
         #[derive(PartialEq)]
         struct SleepJob(Duration);
-        impl IntoJob<()> for SleepJob {
-            fn into_job(&self) -> Job<()> {
+        impl IntoJob<(), ()> for SleepJob {
+            fn into_job(&self) -> Job<(), ()> {
                 let dur = self.0;
-                Box::new(move || Box::pin(async move {
+                Box::new(move |_| Box::pin(async move {
                     task::sleep(dur).await;
                     Ok(Outcome::Success)
                 }))
@@ -740,14 +796,14 @@ mod tests {
         }
 
         struct PseudoJob;
-        impl IntoJob<()> for PseudoJob {
-            fn plan(&self, plan: &mut PlanBuilder<()>) -> Result<(), Error<()>> {
+        impl IntoJob<(), ()> for PseudoJob {
+            fn plan(&self, plan: &mut PlanBuilder<(), ()>) -> Result<(), Error<()>> {
                 plan.add_dependency(SleepJob(Duration::from_millis(60)))?;
                 plan.add_dependency(SleepJob(Duration::from_millis(80)))?;
                 Ok(())
             }
-            fn into_job(&self) -> Job<()> {
-                Box::new(|| Box::pin(async {
+            fn into_job(&self) -> Job<(), ()> {
+                Box::new(|_| Box::pin(async {
                     Ok(Outcome::Success)
                 }))
             }
